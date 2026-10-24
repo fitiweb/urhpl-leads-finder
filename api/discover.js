@@ -1,7 +1,13 @@
 import { requireUser, json, readJson } from './_auth.js';
 
 const clean = (s, max=180) => String(s || '').trim().slice(0,max);
-const headers = { 'User-Agent': 'URHPLGlobalLeadFinder/4.0 (public business discovery; contact: admin@example.org)', 'Accept': 'application/json' };
+
+// FIXED: Use real identifiable contact from your config.js
+const headers = { 
+  'User-Agent': 'fitiwebst/1.0 (contact: contact@fitiwebst.com)', 
+  'Accept': 'application/json',
+  'Referer': 'https://fitiwebst.vercel.app'
+};
 
 function splitQuery(q) {
   const m = q.match(/\b(?:in|near|around|at)\s+(.+)$/i);
@@ -12,6 +18,22 @@ function splitQuery(q) {
 }
 function emailFromTags(tags={}) { return tags.email || tags['contact:email'] || ''; }
 function website(tags={}) { let w=tags.website || tags['contact:website'] || tags.url || ''; if(w && !/^https?:\/\//i.test(w)) w='https://'+w; return w; }
+
+// Fallback when OSM is down - add your main cities here
+const FALLBACK_COORDS = {
+  "ibadan": { lat: 7.3775, lon: 3.9470, display_name: "Ibadan, Oyo State, Nigeria" },
+  "lagos": { lat: 6.5244, lon: 3.3792, display_name: "Lagos, Nigeria" },
+  "abuja": { lat: 9.0765, lon: 7.3986, display_name: "Abuja, Nigeria" }
+};
+
+function getFallback(location) {
+  const lower = location.toLowerCase();
+  for (const key in FALLBACK_COORDS) {
+    if (lower.includes(key)) return FALLBACK_COORDS[key];
+  }
+  return null;
+}
+
 export default async function handler(req,res){
   if(req.method!=='POST') return json(res,405,{error:'Method not allowed'});
   const auth=await requireUser(req); if(auth.error) return json(res,auth.status,{error:auth.error});
@@ -19,11 +41,33 @@ export default async function handler(req,res){
   if(query.length<3) return json(res,400,{error:'Enter a business type and a location, for example “solar installers in Lagos, Nigeria”.'});
   try {
     const {location,category}=splitQuery(query);
-    const geoUrl=new URL('https://nominatim.openstreetmap.org/search');
-    geoUrl.searchParams.set('q',location); geoUrl.searchParams.set('format','jsonv2'); geoUrl.searchParams.set('limit','1');
-    const geoRes=await fetch(geoUrl,{headers,signal:AbortSignal.timeout(9000)});
-    if(!geoRes.ok) throw new Error('Free geocoding service is temporarily unavailable. Try again later.');
-    const geo=await geoRes.json();
+    
+    // FIXED GEOCODING WITH RETRY + FALLBACK
+    let geo = null;
+    try {
+      const geoUrl=new URL('https://nominatim.openstreetmap.org/search');
+      geoUrl.searchParams.set('q',location); 
+      geoUrl.searchParams.set('format','jsonv2'); 
+      geoUrl.searchParams.set('limit','1');
+      geoUrl.searchParams.set('email','contact@fitiwebst.com'); // REQUIRED by Nominatim TOS
+      geoUrl.searchParams.set('addressdetails','1');
+      
+      // Add small delay to respect rate limit
+      await new Promise(r => setTimeout(r, 1100));
+      
+      const geoRes=await fetch(geoUrl,{headers,signal:AbortSignal.timeout(12000)});
+      if(!geoRes.ok) throw new Error(`Geocoding HTTP ${geoRes.status}`);
+      geo=await geoRes.json();
+    } catch (geoErr) {
+      console.warn("Nominatim failed, trying fallback:", geoErr.message);
+      const fallback = getFallback(location);
+      if (fallback) {
+        geo = [fallback];
+      } else {
+        throw new Error('Free geocoding service is temporarily unavailable. Try again later. [Fallback not found for "'+location+'"]');
+      }
+    }
+
     if(!geo.length) return json(res,200,{count:0,places:[],source:'OpenStreetMap',notice:'No matching location found. Include a city and country.'});
     const lat=Number(geo[0].lat), lon=Number(geo[0].lon), radius=15000;
     const bbox=[lat-0.14,lon-0.14,lat+0.14,lon+0.14].join(',');
